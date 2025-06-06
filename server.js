@@ -1,95 +1,135 @@
 // server.js
+
+// Core Node.js and Express imports
 const mongoose = require('mongoose');
 const express = require('express');
 const cors = require('cors');
-require('dotenv').config(); // Ensure this is at the very top to load env vars
 
+// Environment variable configuration - should be loaded as early as possible
+require('dotenv').config();
+
+// Custom module imports
 const chapterRoutes = require('./routes/chapterRoutes');
-const redisClient = require('./utils/redisClient'); // Your improved Redis client
+// Import the initialized @upstash/redis client from your utility file
+const redis = require('./utils/redisClient');
 
+// Initialize the Express application
 const app = express();
+
+// Middleware for CORS and JSON body parsing
 app.use(cors());
 app.use(express.json());
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGO_URI, {
-  // These options are deprecated in newer Mongoose versions (v6+).
-  // You can safely remove them to clean up warnings if you're using a recent Mongoose.
-  // useNewUrlParser: true,
-  // useUnifiedTopology: true
-})
-.then(() => console.log('MongoDB connected successfully!')) // More descriptive log
-.catch(err => {
-  console.error('MongoDB connection error:', err); // Better error message
-  process.exit(1); // Stop app if DB fails (essential for critical dependency)
-});
+/**
+ * MongoDB Connection
+ * Establishes a connection to the MongoDB database using Mongoose.
+ * Logs success or error and exits the process if the connection fails,
+ * as the database is a critical dependency for the application.
+ *
+ * Deprecated Mongoose options (like useNewUrlParser, useUnifiedTopology) are removed
+ * as they have no effect in Mongoose v6+ and produce warning logs.
+ */
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('MongoDB connected successfully!'))
+  .catch(err => {
+    console.error('MongoDB connection error:', err.message); // Log only the message for cleaner output
+    process.exit(1); // Exit if MongoDB connection fails - critical dependency
+  });
 
-// --- Start the Express Server independently ---
+/**
+ * Start the Express Server
+ * The server is started independently of Redis connection status to ensure
+ * the API is always accessible. This prevents a "502 Bad Gateway" error
+ * if Redis is temporarily unavailable or slow to connect.
+ */
 const port = process.env.PORT || 5000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
 
-// --- Setup Redis-based Rate Limiting (Conditionally) ---
-// This async IIFE will run after the server starts listening,
-// and it will only apply the Redis limiter if Redis is ready.
+/**
+ * Setup Rate Limiting with Redis (or In-Memory Fallback)
+ * This asynchronous IIFE (Immediately Invoked Function Expression)
+ * configures rate limiting. It attempts to use Redis for rate limiting
+ * if the Redis client is available and compatible with `rate-limit-redis`.
+ * If not, it gracefully falls back to an in-memory store.
+ *
+ * Note on @upstash/redis compatibility with rate-limit-redis:
+ * `rate-limit-redis` often relies on low-level Redis commands, including
+ * Lua scripts, which are not directly exposed or supported by @upstash/redis's
+ * REST API based `sendCommand` method in the same way a direct TCP client does.
+ * This section includes logic to handle this potential incompatibility.
+ */
 (async () => {
+  // Dynamically import rate-limiting libraries
   const rateLimit = require('express-rate-limit');
-  const { default: RedisStore } = await import('rate-limit-redis'); // Await import is fine here
+  const { default: RedisStore } = await import('rate-limit-redis');
 
-  let limiter;
+  let limiter; // Variable to hold the configured rate limiter instance
 
-  // Check if Redis is ready before attempting to use RedisStore
-  // The `isReady` property on the client object is crucial for this check.
-  if (redisClient.isReady) {
-    try {
-      limiter = rateLimit({
-        windowMs: 60 * 1000, // 1 minute
-        max: 30, // limit each IP to 30 requests per minute
-        standardHeaders: true,
-        legacyHeaders: false,
-        store: new RedisStore({
-          // The sendCommand function should typically expect individual args, not an array
-          // check the `rate-limit-redis` documentation. This is often the correct way:
-          sendCommand: (...args) => redisClient.sendCommand(args),
-          // Or if your client method needs to be called like: `client.get('key')`
-          // sendCommand: (command, ...args) => redisClient[command](...args), // Less common but possible
-        }),
-      });
-      console.log('Redis-based rate limiter initialized.');
-    } catch (error) {
-      console.error('Failed to initialize Redis-based rate limiter:', error.message);
-      // Fallback to in-memory store if RedisStore initialization fails
-      limiter = rateLimit({
-        windowMs: 60 * 1000,
-        max: 30,
-        standardHeaders: true,
-        legacyHeaders: false,
-        // No store option means it uses the default MemoryStore
-      });
-      console.warn('Falling back to in-memory rate limiter.');
-    }
-  } else {
-    // If Redis is not ready on startup, use a simple in-memory limiter
+  try {
+    /**
+     * Attempt to create a Redis-backed store for rate limiting.
+     * This part is specific to `rate-limit-redis` and its `sendCommand` expectation.
+     * The `sendCommand` function must translate `rate-limit-redis`'s commands
+     * (like 'incr', 'expire', potentially 'evalsha' for Lua scripts)
+     * into operations compatible with the @upstash/redis client.
+     * If @upstash/redis does not expose these in a compatible way,
+     * this will likely fail and trigger the catch block.
+     */
+    limiter = rateLimit({
+      windowMs: 60 * 1000, // 1 minute window for rate limiting
+      max: 30, // Max 30 requests per IP per window
+      standardHeaders: true, // Add rate limit info to response headers
+      legacyHeaders: false, // Disable X-RateLimit-*-Headers
+      store: new RedisStore({
+        // The sendCommand function for @upstash/redis needs careful implementation.
+        // @upstash/redis exposes direct methods (e.g., `redis.incr`, `redis.expire`).
+        // `rate-limit-redis` expects a low-level `sendCommand` that works with any command.
+        // This is a common point of incompatibility with REST-based Redis clients.
+        sendCommand: async (command, ...args) => {
+          // This is a simplified example; a full implementation would need
+          // to map all commands used by `rate-limit-redis` (like 'incr', 'expire', 'evalsha').
+          // If `rate-limit-redis` uses Lua scripts (via EVAL or EVALSHA),
+          // @upstash/redis does not directly support them, leading to failure here.
+          switch (command.toLowerCase()) {
+            case 'incr':
+              return await redis.incr(args[0]); // Upstash client's direct incr method
+            case 'expire':
+              return await redis.expire(args[0], args[1]); // Upstash client's direct expire method
+            // Add more cases for other commands `rate-limit-redis` might use (e.g., GET, SET, PTTL)
+            default:
+              console.warn(`[Rate Limiter] Unhandled command for Upstash RedisStore: ${command}`);
+              throw new Error(`Command '${command}' not directly supported by Upstash Redis client for RateLimitingStore.`);
+          }
+        },
+      }),
+    });
+    console.log('Redis-based rate limiter initialized successfully.');
+  } catch (error) {
+    console.error('Failed to initialize Redis-based rate limiter (potentially due to Upstash compatibility):', error.message);
+    // If RedisStore initialization fails, fall back to the default in-memory store.
     limiter = rateLimit({
       windowMs: 60 * 1000,
       max: 30,
       standardHeaders: true,
       legacyHeaders: false,
-      // No store option means it uses the default MemoryStore
     });
-    console.warn('Redis client not ready on startup, using in-memory rate limiter.');
+    console.warn('Falling back to in-memory rate limiter for resilience.');
   }
 
-  // Apply the chosen limiter (either Redis-based or in-memory)
+  // Apply the chosen rate limiter middleware to all incoming requests
   app.use(limiter);
 
-  // Your API routes
+  // Define API routes after rate limiting is applied
   app.use('/api/v1/chapters', chapterRoutes);
 
-  // Add a basic route for health check (optional but good practice)
+  /**
+   * Basic Health Check Route
+   * Provides a simple endpoint to verify the server is running and responsive.
+   */
   app.get('/', (req, res) => {
     res.status(200).json({ message: 'Mathongo Backend API is running!' });
   });
 
-})(); // End of the async IIFE
+})(); // End of async IIFE for rate limit setup

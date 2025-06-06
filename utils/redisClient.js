@@ -1,48 +1,30 @@
 // utils/redisClient.js
-const redis = require('redis');
 
-const client = redis.createClient({
-    url: process.env.REDIS_URL,
-    // Add these options for better resilience, though modern clients have good defaults
-    // If you face timeouts, consider:
-    // socket: {
-    //     connectTimeout: 10000, // 10 seconds for initial connection
-    //     // KeepAlive is often handled by default, but can be explicit
-    // }
+// Import the Redis class from the @upstash/redis library.
+// This library provides a client for interacting with Upstash Redis via its REST API.
+import { Redis } from '@upstash/redis';
+
+/**
+ * Initializes the Upstash Redis client.
+ *
+ * This client connects to Upstash Redis using its REST API, which means
+ * it uses HTTP requests instead of a persistent TCP connection.
+ * As a result, traditional Redis client event listeners (like 'connect', 'error', 'ready')
+ * are not applicable here. Connection and retry logic are handled internally by
+ * the @upstash/redis library for each HTTP request.
+ *
+ * Environment variables for the URL and Token MUST be set for this to work:
+ * - UPSTASH_REDIS_REST_URL: The REST API URL provided by Upstash.
+ * - UPSTASH_REDIS_REST_TOKEN: The REST API token provided by Upstash.
+ */
+const redisClient = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// 1. Handle connection errors more explicitly
-client.on('error', err => {
-    console.error('Redis Client Error:', err.message);
-    // Important: Do NOT add process.exit(1) here if you want your app to survive
-    // without Redis being constantly available. The client library is designed
-    // to attempt re-connections automatically.
-});
-
-// 2. Log connection status (useful for debugging deployments)
-client.on('connect', () => {
-    console.log('Redis client: Attempting to connect...');
-});
-
-client.on('ready', () => {
-    console.log('Redis client: Successfully connected and ready to use!');
-});
-
-client.on('end', () => {
-    console.log('Redis client: Connection closed.');
-});
-
-client.on('reconnecting', () => {
-    console.log('Redis client: Reconnecting...');
-});
-
-// 3. Initiate the connection.
-//    By putting it here, it connects when the module is imported.
-//    The .catch() is good for the *initial* connection failure.
-client.connect().catch(err => {
-    console.error('Redis initial connection failed:', err.message);
-    // If Redis is absolutely critical for your app to start, you could
-    // consider process.exit(1) here, but for caching, it's usually not.
-});
-
-module.exports = client;
+/**
+ * Exports the initialized Upstash Redis client instance.
+ * Other modules can now import and use this 'redisClient' object
+ * to perform Redis operations (e.g., get, set, incr).
+ */
+module.exports = redisClient;
