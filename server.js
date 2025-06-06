@@ -10,8 +10,9 @@ require('dotenv').config();
 
 // Custom module imports
 const chapterRoutes = require('./routes/chapterRoutes');
-// Import the initialized @upstash/redis client from your utility file
-const redis = require('./utils/redisClient');
+// Import the object exported by utils/redisClient.js.
+// We now access the client instance via 'redisClientWrapper.client'.
+const redisClientWrapper = require('./utils/redisClient');
 
 // Initialize the Express application
 const app = express();
@@ -25,14 +26,11 @@ app.use(express.json());
  * Establishes a connection to the MongoDB database using Mongoose.
  * Logs success or error and exits the process if the connection fails,
  * as the database is a critical dependency for the application.
- *
- * Deprecated Mongoose options (like useNewUrlParser, useUnifiedTopology) are removed
- * as they have no effect in Mongoose v6+ and produce warning logs.
  */
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB connected successfully!'))
   .catch(err => {
-    console.error('MongoDB connection error:', err.message); // Log only the message for cleaner output
+    console.error('MongoDB connection error:', err.message);
     process.exit(1); // Exit if MongoDB connection fails - critical dependency
   });
 
@@ -66,49 +64,67 @@ app.listen(port, () => {
   const { default: RedisStore } = await import('rate-limit-redis');
 
   let limiter; // Variable to hold the configured rate limiter instance
+  const currentRedisClient = redisClientWrapper.client; // Access the client via the getter
 
   try {
     /**
      * Attempt to create a Redis-backed store for rate limiting.
      * This part is specific to `rate-limit-redis` and its `sendCommand` expectation.
-     * The `sendCommand` function must translate `rate-limit-redis`'s commands
-     * (like 'incr', 'expire', potentially 'evalsha' for Lua scripts)
-     * into operations compatible with the @upstash/redis client.
-     * If @upstash/redis does not expose these in a compatible way,
-     * this will likely fail and trigger the catch block.
+     *
+     * IMPORTANT: The `@upstash/redis` client is a REST client. It does not
+     * support arbitrary `sendCommand` calls or Lua scripting in the same way
+     * a direct TCP Redis client does. This is a common point of incompatibility.
+     * `rate-limit-redis` uses specific commands like `incr` and `expire`,
+     * and potentially `evalsha` for atomic operations.
+     *
+     * If this `sendCommand` mapping is insufficient for `rate-limit-redis`'s
+     * internal logic, this `try` block will still fail, and it will fall back
+     * to the in-memory store.
      */
-    limiter = rateLimit({
-      windowMs: 60 * 1000, // 1 minute window for rate limiting
-      max: 30, // Max 30 requests per IP per window
-      standardHeaders: true, // Add rate limit info to response headers
-      legacyHeaders: false, // Disable X-RateLimit-*-Headers
-      store: new RedisStore({
-        // The sendCommand function for @upstash/redis needs careful implementation.
-        // @upstash/redis exposes direct methods (e.g., `redis.incr`, `redis.expire`).
-        // `rate-limit-redis` expects a low-level `sendCommand` that works with any command.
-        // This is a common point of incompatibility with REST-based Redis clients.
-        sendCommand: async (command, ...args) => {
-          // This is a simplified example; a full implementation would need
-          // to map all commands used by `rate-limit-redis` (like 'incr', 'expire', 'evalsha').
-          // If `rate-limit-redis` uses Lua scripts (via EVAL or EVALSHA),
-          // @upstash/redis does not directly support them, leading to failure here.
-          switch (command.toLowerCase()) {
-            case 'incr':
-              return await redis.incr(args[0]); // Upstash client's direct incr method
-            case 'expire':
-              return await redis.expire(args[0], args[1]); // Upstash client's direct expire method
-            // Add more cases for other commands `rate-limit-redis` might use (e.g., GET, SET, PTTL)
-            default:
-              console.warn(`[Rate Limiter] Unhandled command for Upstash RedisStore: ${command}`);
-              throw new Error(`Command '${command}' not directly supported by Upstash Redis client for RateLimitingStore.`);
-          }
-        },
-      }),
-    });
-    console.log('Redis-based rate limiter initialized successfully.');
+    if (currentRedisClient) { // Only attempt if the Upstash client was successfully initialized
+      limiter = rateLimit({
+        windowMs: 60 * 1000, // 1 minute window for rate limiting
+        max: 30, // Max 30 requests per IP per window
+        standardHeaders: true, // Add rate limit info to response headers
+        legacyHeaders: false, // Disable X-RateLimit-*-Headers
+        store: new RedisStore({
+          sendCommand: async (command, ...args) => {
+            const lowerCommand = command.toLowerCase();
+            switch (lowerCommand) {
+              case 'incr':
+                return await currentRedisClient.incr(args[0]);
+              case 'expire':
+                return await currentRedisClient.expire(args[0], args[1]);
+              case 'get': // Some Redis stores might use get
+                return await currentRedisClient.get(args[0]);
+              case 'set': // Some Redis stores might use set
+                  return await currentRedisClient.set(args[0], args[1]);
+              case 'evalsha': // `rate-limit-redis` often uses this for atomic operations
+              case 'eval': // Alternative for Lua scripts
+                console.warn(`[Rate Limiter] Upstash Redis client does not support Lua scripting (EVAL/EVALSHA) directly. Falling back to in-memory store for rate limiting.`);
+                // Throw an error here to trigger the catch block and use the in-memory store.
+                throw new Error(`Lua scripting not supported by Upstash for rate limiting store.`);
+              default:
+                console.warn(`[Rate Limiter] Unhandled Redis command for Upstash RedisStore: ${command}. Falling back to in-memory store.`);
+                throw new Error(`Unhandled Redis command '${command}' for Upstash RedisStore.`);
+            }
+          },
+        }),
+      });
+      console.log('Redis-based rate limiter initialized successfully.');
+    } else {
+      // If Upstash client itself failed to initialize
+      console.warn('Upstash Redis client not available for rate limiting. Using in-memory rate limiter.');
+      limiter = rateLimit({
+        windowMs: 60 * 1000,
+        max: 30,
+        standardHeaders: true,
+        legacyHeaders: false,
+      });
+    }
   } catch (error) {
-    console.error('Failed to initialize Redis-based rate limiter (potentially due to Upstash compatibility):', error.message);
-    // If RedisStore initialization fails, fall back to the default in-memory store.
+    console.error('Failed to initialize Redis-based rate limiter:', error.message);
+    // Fall back to the default in-memory store if RedisStore initialization fails
     limiter = rateLimit({
       windowMs: 60 * 1000,
       max: 30,
